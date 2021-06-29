@@ -4,8 +4,14 @@ import yfinance as yf
 import matplotlib.pyplot as plt
 import datetime as dt
 import quandl
+import requests
+import json
 
 quandl.ApiConfig.api_key = "59sg9vqYvngzUw5Xizvi"
+
+API_KEY = 'bd5d7f39831527596de9d85eb60ab188'
+
+
 
 class UniverseData():
     def __init__(self, sdate, edate):
@@ -20,19 +26,31 @@ class UniverseData():
     def update_yfinance(self, data_list):        
         self.data_list += data_list
         for ticker in data_list:
+            print('retrieving {} from yfinance'.format(ticker))
             ticker_df = yf.Ticker(ticker).history(
             	start = self.sdate, end = self.edate).Close.to_frame().rename(\
                 columns = {'Close':ticker})
             self.data_df = pd.concat([self.data_df, ticker_df],axis = 1)
             
+            
     def update_quandl(self, data_list):
+
         self.data_list += data_list
 
         for ticker in data_list:
+            print('retrieving {} from Quandl'.format(ticker))
             ticker_df =  quandl.get(ticker, 
             	start_date = self.sdate, end_date = self.edate).rename(\
                 columns = {'Value':ticker})
             self.data_df = pd.concat([self.data_df, ticker_df], axis = 1)
+
+    def update_ALFRED(self, data_list):
+        self.data_list += data_list
+
+        for ticker in data_list:
+            ticker_df = self._get_ALFRED_data(ticker,REAL_TIME_START=self.sdate,REAL_TIME_END='9999-12-31')
+            self.data_df = pd.concat([self.data_df, ticker_df], axis = 1)
+
 
     def combine(self, col1, col2):
         df = self.data_df
@@ -53,11 +71,44 @@ class UniverseData():
 
         self.data_df = df
 
+    def _get_ALFRED_data(self, ID, REAL_TIME_START, REAL_TIME_END):
+        url = 'https://api.stlouisfed.org/fred/series/observations?series_id={}'.format(ID)
+        url += '&realtime_start={}&realtime_end={}&api_key={}&file_type=json'.format(REAL_TIME_START, REAL_TIME_END, API_KEY)
+        
+        print('retrieving {} from ALFRED'.format(ID))
+        
+        response = requests.get(url)
+        observations = json.loads(response.text)['observations']
+
+        revision_to_date_to_value = {}
+        for obs in observations:
+            revision = dt.datetime.strptime(obs['realtime_start'], '%Y-%m-%d')
+            date =  dt.datetime.strptime(obs['date'], '%Y-%m-%d')
+            try :
+                value = float(obs['value'])
+            except:
+                value = np.nan
+
+            try : 
+                revision_to_date_to_value[revision][date] = value
+            except: 
+                revision_to_date_to_value[revision] = {date : value}
+
+        data_df = pd.DataFrame(revision_to_date_to_value).resample('MS').mean().sort_index()
+        data_df = data_df.reindex(sorted(data_df.columns), axis = 1)
+        data_df = pd.concat({ID:data_df}, axis = 1).T.bfill().T
+        data_df = data_df[[data_df.columns[0]]]
+        data_df.columns = data_df.columns.get_level_values(0)
+
+        return data_df
+
 
 
 class BackTestModule():
     def __init__(self, target_df, price_df, sdate, edate, 
-        rebal_period = 1, transaction_cost = 0, rebal_bound = 0.05):
+        rebal_period = 1, transaction_cost = 0, rebal_bound = 0.05,
+        verbose = False):
+        self.verbose = verbose
         self.price_df = price_df
         self.bussiness_date_list = list(self.price_df[['^GSPC']].dropna().index)
         self.target_df = target_df
@@ -107,7 +158,8 @@ class BackTestModule():
             else:
                 self.edate -= dt.timedelta(days = 1)
 
-        print(self.sdate, self.edate)
+        if self.verbose:
+            print(self.sdate, self.edate)
 
 
     def run_backtest(self):
@@ -143,13 +195,17 @@ class BackTestModule():
             if is_rebal:
                 target_asset = sum(curr_asset) * self.date_to_target[date]
                 assert abs(sum(curr_asset-target_asset)/sum(curr_asset)) < 1e-4
-                transaction_amount = sum((target_asset-curr_asset).apply(np.abs))
+
+                long_plan = (target_asset-curr_asset).apply(lambda x : np.max([0,x]))
+                short_plan = (target_asset-curr_asset).apply(lambda x : np.max([0,-x]))
+                transaction_amount = sum(long_plan + short_plan)
                 
                 if transaction_amount / sum(curr_asset) < self.rebal_bound:
                     target_asset = curr_asset.copy()
                 else:
-                    transaction_fee = transaction_amount*self.transaction_cost
-                    target_asset = (sum(curr_asset)-transaction_fee) * self.date_to_target[date]
+                    long_plan *= (1. - 2 * self.transaction_cost)
+                    target_asset = curr_asset + long_plan - short_plan
+
             else:
                 target_asset = curr_asset.copy()
 
@@ -183,13 +239,18 @@ class BackTestModule():
         else:
             information_ratio = None
 
-        MDD = max((self.asset_df.sum(axis=1).cummax()-self.asset_df.sum(axis=1))/self.asset_df.sum(axis=1).cummax())
+        MDD = max((self.asset_df.sum(axis=1).cummax()-self.asset_df.sum(axis=1))/
+                    self.asset_df.sum(axis=1).cummax())
+
+        Turnover = (0.5 * self.transaction_df.apply(np.abs).sum(axis = 1)/
+                    self.asset_df.sum(axis=1)).resample('y').sum().mean()
 
         stat = {
         'CAGR':CAGR,
         'sharpe_ratio':sharpe_ratio,
         'information_ratio':information_ratio,
-        'MDD':MDD
+        'MDD':MDD,
+        'Yearly turnover' : Turnover
         }
 
         return stat
